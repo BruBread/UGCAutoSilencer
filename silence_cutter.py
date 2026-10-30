@@ -1,14 +1,16 @@
 """Silence Cutter: find silences in a video, review them in the browser, render the cut."""
+import json
+import subprocess
 from pathlib import Path
 
 import numpy as np
 
 # Tuning (seconds unless noted)
 FRAME = 0.02            # loudness frame
-THRESH_FRACTION = 0.65  # silence line, 0 = noise floor, 1 = speech level
+THRESH_FRACTION = 0.70  # silence line, 0 = noise floor, 1 = speech level
 MIN_GAP = 0.25          # shorter silences stay in
 MIN_BLIP = 0.10         # shorter sounds are ignored
-PAD = 0.04              # kept around each spoken piece
+PAD = 0.08              # kept around each spoken piece
 FADE = 0.01             # audio fade at each cut
 MIN_CONTRAST_DB = 6     # below this the video is all speech or all silence
 ABS_SILENCE_DB = -45    # a video whose loud parts sit below this is all silence
@@ -51,6 +53,43 @@ def detect_pieces(db, duration):
         else:
             pieces.append((s, e))
     return pieces
+
+
+def probe(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise SystemExit(f"Could not read this file as a video:\n{r.stderr.strip()}")
+    j = json.loads(r.stdout)
+    video = next((s for s in j["streams"] if s["codec_type"] == "video"), None)
+    if video is None:
+        raise SystemExit("This file has no video stream.")
+    return {
+        "duration": float(j["format"]["duration"]),
+        "fps": video.get("r_frame_rate", "30/1"),
+        "hdr": video.get("color_transfer") in ("arib-std-b67", "smpte2084"),
+        "transfer": video.get("color_transfer"),
+        "has_audio": any(s["codec_type"] == "audio" for s in j["streams"]),
+    }
+
+
+def decode_audio(path, sr=16000, band=True):
+    """Mono float32 samples. band=True keeps only the voice range, dropping hum and rumble."""
+    args = ["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(sr)]
+    if band:
+        args += ["-af", "highpass=f=100,lowpass=f=4000"]
+    r = subprocess.run(args + ["-f", "f32le", "-"], capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit(f"Could not read the audio:\n{r.stderr.decode(errors='replace').strip()}")
+    return np.frombuffer(r.stdout, np.float32)
+
+
+def analyze(path):
+    info = probe(path)
+    if not info["has_audio"]:
+        raise SystemExit("This video has no audio, so there is nothing to detect silence in.")
+    db = loudness_db(decode_audio(path), 16000)
+    return info, db, detect_pieces(db, info["duration"])
 
 
 def next_output_path(src):
