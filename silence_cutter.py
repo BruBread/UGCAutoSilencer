@@ -136,18 +136,35 @@ ENCODERS = [
     ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"],  # when the AMD encoder is unavailable
 ]
 BACKGROUND = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)  # keeps the review page snappy
+STALL = 60  # seconds without progress before an ffmpeg run counts as stuck
 
 
 def _ffmpeg_with_progress(cmd, cwd, seconds, on_progress, flags=0, keep=lambda p: None):
-    """Run ffmpeg with -progress on stdout; return (returncode, stderr)."""
-    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=flags)
-    keep(p)
-    for line in p.stdout:
-        if line.startswith("out_time_us=") and seconds > 0:
-            us = line.split("=", 1)[1].strip()
-            if us.isdigit():
-                on_progress(min(1.0, int(us) / 1e6 / seconds))
-    return p.wait(), p.stderr.read()
+    """Run ffmpeg with -progress on stdout; return (returncode, stderr). Kills it if it stalls for STALL seconds."""
+    with tempfile.TemporaryFile("w+") as err:  # a file, not a pipe: a full, unread stderr pipe freezes ffmpeg
+        p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=err, text=True, creationflags=flags)
+        keep(p)
+        last, stalled = [time.time(), None], []
+
+        def watch():
+            while p.poll() is None:
+                if time.time() - last[0] > STALL:
+                    stalled.append(True)
+                    p.kill()
+                    return
+                time.sleep(0.5)
+
+        threading.Thread(target=watch, daemon=True).start()
+        for line in p.stdout:
+            if line.startswith("out_time_us="):
+                us = line.split("=", 1)[1].strip()
+                if us != last[1]:  # ffmpeg keeps printing reports while stuck, so only a moving time counts
+                    last[:] = time.time(), us
+                if us.isdigit() and seconds > 0:
+                    on_progress(min(1.0, int(us) / 1e6 / seconds))
+        code = p.wait()
+        err.seek(0)
+        return code, (f"FFmpeg stopped responding for {STALL} seconds.\n" if stalled else "") + err.read()
 
 
 class SegmentCache:
@@ -232,7 +249,8 @@ class SegmentCache:
         frames = end - first
         convert = (HDR_TO_SDR if self.info["hdr"] else "format=yuv420p") + SDR_TAGS
         err = ""
-        for enc in [self.encoder] if self.encoder else ENCODERS:  # every segment must use the same encoder to join
+        # Every segment must use the same encoder to join, so a stall retries with that encoder once
+        for enc in [self.encoder] * 2 if self.encoder else ENCODERS:
             cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{float(first / self.fps):.6f}",
                    "-to", f"{float(end / self.fps):.6f}",
                    "-i", str(self.src), "-an", "-vf", f"{convert},tpad=stop_mode=clone:stop=2",

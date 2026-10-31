@@ -1,7 +1,9 @@
 """Plain-assert checks. Run: python test_silence_cutter.py"""
 import os
 import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -224,6 +226,18 @@ def test_render_failure_leaves_nothing():
         else:
             raise AssertionError("expected RuntimeError")
         assert list(Path(d).iterdir()) == [], list(Path(d).iterdir())
+
+
+def test_stalled_ffmpeg_is_killed():
+    # Prints the same progress time forever, like a stuck encoder; plus enough stderr to fill a pipe
+    fake = "import sys, time\nsys.stderr.write('x' * 100000)\nwhile True:\n    print('out_time_us=5', flush=True)\n    time.sleep(0.1)"
+    stall, sc.STALL = sc.STALL, 1
+    try:
+        start = time.time()
+        code, err = sc._ffmpeg_with_progress([sys.executable, "-c", fake], ".", 10, lambda v: None)
+    finally:
+        sc.STALL = stall
+    assert code != 0 and "stopped responding" in err and time.time() - start < 10, (code, err[:80])
 
 
 def test_server():
