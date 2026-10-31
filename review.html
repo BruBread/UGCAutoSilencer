@@ -366,11 +366,16 @@ setInterval(async () => {
   } catch {}
 }, 1500);
 
-vid.addEventListener("error", () => {
+function usePreview() {
   if (vid.src.endsWith("/preview")) { flash("This video can't be previewed in the browser."); return; }
   flash("Preparing a preview copy your browser can play...");
+  const t = vid.currentTime;
   vid.src = "/preview";
-});
+  vid.currentTime = t;
+}
+vid.addEventListener("error", usePreview);
+// A video track the browser can't decode (e.g. iPhone HEVC) fires no error: the audio plays over a black box
+vid.addEventListener("loadedmetadata", () => { if (!vid.videoWidth) usePreview(); });
 vid.addEventListener("loadeddata", () => { if (vid.src.endsWith("/preview")) flash(""); });
 
 fetch("/data").then(r => r.json()).then(d => {
