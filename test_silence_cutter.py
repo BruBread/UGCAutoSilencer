@@ -111,6 +111,32 @@ def test_sample_match():
     assert missing < 1.0, missing
 
 
+def test_render_duration():
+    with tempfile.TemporaryDirectory() as d:
+        src, out = Path(d) / "src.mp4", Path(d) / "out.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-f", "lavfi", "-i", "sine=f=300",
+               "-t", "4", "-pix_fmt", "yuv420p", str(src))
+        seen = []
+        sc.render(src, sc.probe(src), [(0.5, 1.5), (2.0, 3.0)], out, seen.append)
+        got = sc.probe(out)["duration"]
+        assert abs(got - 2.0) <= 0.1, got
+        assert sc.probe(out)["transfer"] == "bt709"
+        assert seen and max(seen) >= 0.99, seen[-3:]
+
+
+def test_render_failure_leaves_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "out.mp4"
+        info = {"duration": 4.0, "fps": "30/1", "hdr": False, "transfer": None, "has_audio": True}
+        try:
+            sc.render(Path(d) / "missing.mp4", info, [(0.0, 1.0)], out, lambda p: None)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected RuntimeError")
+        assert list(Path(d).iterdir()) == [], list(Path(d).iterdir())
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

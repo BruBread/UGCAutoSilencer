@@ -1,6 +1,8 @@
 """Silence Cutter: find silences in a video, review them in the browser, render the cut."""
 import json
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -90,6 +92,89 @@ def analyze(path):
         raise SystemExit("This video has no audio, so there is nothing to detect silence in.")
     db = loudness_db(decode_audio(path), 16000)
     return info, db, detect_pieces(db, info["duration"])
+
+
+LUT_SIZE = 33
+
+
+def _write_tonemap_lut(transfer, path):
+    """Bake the HDR->SDR conversion into a 3D LUT. Same look as running zscale+tonemap per frame
+    (checked on the iPhone sample: closest to CapCut's own export), about 4x less CPU."""
+    g = np.linspace(0, 1, LUT_SIZE)
+    b, gr, r = np.meshgrid(g, g, g, indexing="ij")  # .cube order: red changes fastest
+    lattice = (np.stack([r.ravel(), gr.ravel(), b.ravel()], 1) * 65535).round().astype("<u2")
+    chain = (f"setparams=color_trc={transfer}:color_primaries=bt2020:colorspace=gbr:range=pc,"
+             "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
+             "zscale=t=bt709,format=gbrpf32le")
+    res = subprocess.run(["ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb48le",
+                          "-s", f"{LUT_SIZE * LUT_SIZE}x{LUT_SIZE}", "-i", "-", "-vf", chain,
+                          "-f", "rawvideo", "-pix_fmt", "gbrpf32le", "-"],
+                         input=lattice.tobytes(), capture_output=True)
+    if res.returncode != 0:
+        raise RuntimeError("Could not build the HDR conversion:\n" + res.stderr.decode(errors="replace")[-500:])
+    gp, bp, rp = np.frombuffer(res.stdout, "<f4").reshape(3, -1)
+    rgb = np.stack([rp, gp, bp], 1).clip(0, 1)
+    rows = "\n".join(f"{x:.6f} {y:.6f} {z:.6f}" for x, y, z in rgb)
+    Path(path).write_text(f"LUT_3D_SIZE {LUT_SIZE}\n{rows}\n")
+
+
+SDR_TAGS = ",setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+HDR_TO_SDR = ("scale=in_color_matrix=bt2020:in_range=tv,format=gbrp16le,lut3d=file=tonemap.cube:interp=tetrahedral,"
+              "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p")
+
+
+def _filter_graph(pieces, info):
+    """Input i is piece i (seeked with -ss/-to), so only kept parts get decoded."""
+    lines, labels = [], []
+    for i, (a, b) in enumerate(pieces):
+        fade_out = max(0.0, b - a - FADE)
+        lines.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}];")
+        lines.append(f"[{i}:a]asetpts=PTS-STARTPTS,afade=t=in:d={FADE},afade=t=out:st={fade_out:.4f}:d={FADE}[a{i}];")
+        labels.append(f"[v{i}][a{i}]")
+    # Tag the result as SDR BT.709 so players don't treat converted iPhone footage as HDR
+    video_out = (HDR_TO_SDR if info["hdr"] else "format=yuv420p") + SDR_TAGS
+    lines.append(f"{''.join(labels)}concat=n={len(pieces)}:v=1:a=1[cv][outa];[cv]{video_out}[outv]")
+    return "\n".join(lines)
+
+
+ENCODERS = [
+    ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "18"],
+    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"],  # when the AMD encoder is unavailable
+]
+
+
+def render(src, info, pieces, out, on_progress):
+    """Cut `pieces` out of `src` into `out`. Writes to a .part file first so a failure leaves nothing behind."""
+    out = Path(out).resolve()
+    part = out.with_suffix(".part.mp4")
+    total = sum(b - a for a, b in pieces)
+    # ponytail: one input per piece; a few hundred pieces would hit the Windows command-line limit
+    inputs = [x for a, b in pieces for x in ("-ss", f"{a:.4f}", "-to", f"{b:.4f}", "-i", str(Path(src).resolve()))]
+    with tempfile.TemporaryDirectory() as work:  # ffmpeg runs here so filter files need no path escaping
+        (Path(work) / "graph.txt").write_text(_filter_graph(pieces, info))
+        if info["hdr"]:
+            _write_tonemap_lut(info["transfer"], Path(work) / "tonemap.cube")
+        err = ""
+        for enc in ENCODERS:
+            cmd = ["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex_script", "graph.txt",
+                   "-map", "[outv]", "-map", "[outa]", *enc, "-pix_fmt", "yuv420p",
+                   "-fps_mode", "cfr", "-r", info["fps"], "-c:a", "aac", "-b:a", "192k",
+                   "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(part)]
+            p = subprocess.Popen(cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for line in p.stdout:
+                if line.startswith("out_time_us=") and total > 0:
+                    us = line.split("=", 1)[1].strip()
+                    if us.isdigit():
+                        on_progress(min(1.0, int(us) / 1e6 / total))
+            err = p.stderr.read()
+            if p.wait() == 0:
+                os.replace(part, out)
+                on_progress(1.0)
+                return
+            part.unlink(missing_ok=True)
+            if not Path(src).exists():
+                break
+        raise RuntimeError("FFmpeg failed:\n" + "\n".join(err.strip().splitlines()[-5:]))
 
 
 def next_output_path(src):
