@@ -137,6 +137,40 @@ def test_render_failure_leaves_nothing():
         assert list(Path(d).iterdir()) == [], list(Path(d).iterdir())
 
 
+def test_server():
+    import json
+    import threading
+    import urllib.error
+    import urllib.request
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "src.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30", "-f", "lavfi", "-i", "sine=f=300",
+               "-t", "3", "-pix_fmt", "yuv420p", str(src))
+        info, db, pieces = sc.analyze(src)
+        state = sc.State(src, info, db, [(0.5, 1.0), (2.0, 2.5)], Path(d))
+        srv = sc.make_server(state)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            data = json.load(urllib.request.urlopen(base + "/data"))
+            assert data["pieces"] == [[0.5, 1.0], [2.0, 2.5]] and abs(data["duration"] - 3) < 0.1, data
+            req = urllib.request.Request(base + "/video", headers={"Range": "bytes=10-19"})
+            r = urllib.request.urlopen(req)
+            assert r.status == 206 and len(r.read()) == 10
+            assert r.headers["Content-Range"].startswith("bytes 10-19/")
+            bad = urllib.request.Request(base + "/save", data=b'{"pieces": [[2, 1]]}', method="POST")
+            try:
+                urllib.request.urlopen(bad)
+                raise AssertionError("bad pieces accepted")
+            except urllib.error.HTTPError as e:
+                assert e.code == 400
+            urls = json.load(urllib.request.urlopen(base + "/frames?start=0&end=2&n=4"))
+            assert len(urls) == 4 and urllib.request.urlopen(base + urls[0]).read()[:2] == b"\xff\xd8"
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

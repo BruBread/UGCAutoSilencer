@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Silence Cutter</title>
+<style>
+  :root { --ink:#16181d; --muted:#5d6470; --line:#d5d9df; --bg:#f6f7f9; --card:#fff; --cut:#d93636; --cutbg:rgba(217,54,54,.28); --wave:#3d6fd9; --wave2:#7a8696; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width:960px; margin:0 auto; padding:20px 16px 40px; }
+  .top { display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+  .top b { font-size:22px; }
+  .muted { color:var(--muted); }
+  .vidbox { position:relative; width:fit-content; max-width:100%; margin:0 auto 16px; }
+  video { display:block; max-width:100%; max-height:46vh; border-radius:10px; background:#000; outline:4px solid transparent; outline-offset:-4px; }
+  .vidbox.incut video { outline-color:var(--cut); }
+  .badge { position:absolute; top:12px; left:12px; background:var(--cut); color:#fff; font-weight:700; font-size:14px; padding:4px 12px; border-radius:6px; display:none; }
+  .vidbox.incut .badge { display:block; }
+  .label { font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:16px 0 6px; }
+  .wrap { position:relative; user-select:none; touch-action:none; }
+  canvas { display:block; width:100%; }
+  #over { height:48px; border-radius:8px; background:#e9ecf0; cursor:pointer; }
+  #film { height:96px; border-radius:8px 8px 0 0; background:#222; }
+  #wave { height:110px; border-radius:0 0 8px 8px; background:#eef1f5; }
+  .cut { position:absolute; top:0; bottom:0; background:var(--cutbg); pointer-events:none; }
+  .edge { position:absolute; top:-8px; bottom:-8px; width:22px; margin-left:-11px; cursor:ew-resize; }
+  .edge::before { content:""; position:absolute; left:9px; top:0; bottom:0; width:4px; background:var(--cut); border-radius:2px; }
+  .edge span { position:absolute; top:-26px; left:50%; transform:translateX(-50%); white-space:nowrap; font-size:13px; font-weight:600; color:var(--cut); }
+  .head { position:absolute; top:-4px; bottom:-4px; width:3px; margin-left:-1px; background:#fff; box-shadow:0 0 0 1px var(--ink); pointer-events:none; }
+  .times { display:flex; justify-content:space-between; font-size:13px; color:var(--muted); margin-top:4px; }
+  input[type=range] { width:100%; margin-top:12px; accent-color:var(--ink); }
+  .info { margin-top:8px; font-size:15px; }
+  .btns { display:flex; gap:10px; margin-top:18px; flex-wrap:wrap; }
+  button { font:inherit; font-size:15px; padding:10px 16px; border-radius:8px; border:1px solid #c3c8cf; background:var(--card); color:var(--ink); cursor:pointer; }
+  button:hover { border-color:var(--ink); }
+  button.go { background:var(--ink); color:#fff; border-color:var(--ink); }
+  .spacer { flex:1; }
+  kbd { font:12px ui-monospace, monospace; opacity:.75; margin-left:6px; }
+  .help { margin-top:14px; font-size:14px; color:var(--muted); }
+  #overlay { position:fixed; inset:0; background:rgba(246,247,249,.94); display:none; align-items:center; justify-content:center; padding:16px; }
+  #overlay.show { display:flex; }
+  .box { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:28px; width:min(520px,100%); text-align:center; }
+  .bar { height:14px; border-radius:7px; background:#e3e6ea; overflow:hidden; margin:16px 0 8px; }
+  .bar div { height:100%; width:0; background:var(--ink); transition:width .3s; }
+  .path { word-break:break-all; font-family:ui-monospace, monospace; font-size:14px; }
+  #status { min-height:1.5em; }
+</style>
+</head>
+<body>
+<main>
+  <div class="top"><b id="title">Loading...</b><span class="muted" id="lengths"></span></div>
+  <div class="vidbox" id="vb"><video id="vid" preload="auto" playsinline></video><div class="badge">THIS PART GETS CUT</div></div>
+  <div id="status" class="muted"></div>
+
+  <div class="label">Whole video: click a red mark to jump to it</div>
+  <canvas id="over"></canvas>
+
+  <div class="label" style="margin-top:34px">This silence, zoomed in: frames on top, audio below</div>
+  <div class="wrap" id="zoom">
+    <canvas id="film"></canvas>
+    <canvas id="wave"></canvas>
+    <div class="cut" id="cut"></div>
+    <div class="edge" id="e1"><span>Cut starts</span></div>
+    <div class="edge" id="e2"><span>Cut ends</span></div>
+    <div class="head" id="head"></div>
+  </div>
+  <div class="times"><span id="t0"></span><span id="tm"></span><span id="t1"></span></div>
+  <input type="range" id="slider" min="0" max="1000" value="0" aria-label="Playhead">
+  <div class="info" id="info"></div>
+
+  <div class="btns">
+    <button id="prev">&larr; Previous<kbd>Backspace</kbd></button>
+    <button id="play">&#9654; Play across cut<kbd>Space</kbd></button>
+    <button id="keep">Keep this silence<kbd>S</kbd></button>
+    <button id="del">Delete this take<kbd>D</kbd></button>
+    <span class="spacer"></span>
+    <button id="next" class="go">Accept &amp; next<kbd style="color:#fff">Enter</kbd></button>
+  </div>
+  <div class="btns">
+    <span class="spacer"></span>
+    <button id="save">Accept the rest &amp; save</button>
+  </div>
+  <p class="help">Drag the red edges to move the cut. <b>[</b> / <b>]</b> set the cut start / end at the slider. <b>&larr;</b> / <b>&rarr;</b> step one frame. <b>D</b> deletes the spoken piece under the slider (for retakes).</p>
+</main>
+
+<div id="overlay"><div class="box">
+  <b id="ovTitle" style="font-size:20px">Saving...</b>
+  <div class="bar"><div id="ovBar"></div></div>
+  <div id="ovText" class="muted"></div>
+</div></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const vid = $("vid"), slider = $("slider");
+let D = 0, FR = 0.02, db = [], pieces = [], cur = 0, win = [0, 1], frameUrls = [], frameImgs = [], playStop = null;
+const fmt = t => { const m = Math.floor(t / 60), s = t - m * 60; return m + ":" + s.toFixed(2).padStart(5, "0"); };
+
+function gaps() {
+  const g = [];
+  for (let i = 0; i <= pieces.length; i++) {
+    const s = i ? pieces[i - 1][1] : 0, e = i < pieces.length ? pieces[i][0] : D;
+    if (e - s > 0.01) g.push({ s, e, i });  // i: index of the piece after this gap
+  }
+  return g;
+}
+const inCut = t => !pieces.some(([a, b]) => t >= a && t < b);
+const kept = () => pieces.reduce((n, [a, b]) => n + b - a, 0);
+
+function sizeCanvas(c) {
+  const r = window.devicePixelRatio || 1;
+  c.width = Math.round(c.clientWidth * r); c.height = Math.round(c.clientHeight * r);
+  return c.getContext("2d");
+}
+
+function drawWave(c, t0, t1, color) {
+  const ctx = sizeCanvas(c), W = c.width, H = c.height;
+  ctx.clearRect(0, 0, W, H);
+  if (!db.length) return ctx;
+  const lo = Math.min(...db.filter((_, i) => i % 7 === 0)), hi = Math.max(...db.filter((_, i) => i % 7 === 0));
+  ctx.fillStyle = color;
+  const step = 3 * (window.devicePixelRatio || 1);
+  for (let x = 0; x < W; x += step) {
+    const a = Math.floor((t0 + (x / W) * (t1 - t0)) / FR), b = Math.max(a + 1, Math.floor((t0 + ((x + step) / W) * (t1 - t0)) / FR));
+    let m = -200; for (let k = a; k < b && k < db.length; k++) if (db[k] > m) m = db[k];
+    const v = Math.max(0.02, (m - lo) / (hi - lo || 1)), h = v * H * 0.9;
+    ctx.fillRect(x, (H - h) / 2, step - 1, h);
+  }
+  return ctx;
+}
+
+function drawOverview() {
+  const c = $("over"), ctx = drawWave(c, 0, D, "#7a8696"), W = c.width, H = c.height;
+  gaps().forEach((g, k) => {
+    ctx.fillStyle = k === cur ? "rgba(217,54,54,.75)" : "rgba(217,54,54,.32)";
+    ctx.fillRect((g.s / D) * W, 0, Math.max(2, ((g.e - g.s) / D) * W), H);
+  });
+  ctx.fillStyle = "#16181d"; ctx.fillRect((vid.currentTime / D) * W - 1, 0, 2, H);
+}
+
+function drawFilm() {
+  const c = $("film"), ctx = sizeCanvas(c), W = c.width, H = c.height, n = frameImgs.length;
+  ctx.fillStyle = "#222"; ctx.fillRect(0, 0, W, H);
+  frameImgs.forEach((img, i) => {
+    if (!img.complete || !img.naturalWidth) return;
+    const slotW = W / n, h = H - 8, w = Math.min(slotW - 4, (img.naturalWidth / img.naturalHeight) * h);
+    ctx.drawImage(img, i * slotW + (slotW - w) / 2, 4, w, h);
+  });
+}
+
+function loadFrames() {
+  const [a, b] = win, key = a.toFixed(3) + "-" + b.toFixed(3);
+  if (loadFrames.key === key) return; loadFrames.key = key;
+  frameImgs = [];
+  drawFilm();
+  fetch(`/frames?start=${a}&end=${b}&n=12`).then(r => r.json()).then(urls => {
+    if (loadFrames.key !== key) return;
+    frameImgs = urls.map(u => { const im = new Image(); im.onload = drawFilm; im.src = u; return im; });
+  }).catch(() => {});
+}
+
+function setWindow() {
+  const g = gaps()[cur];
+  if (!g) { win = [0, Math.min(D, 4)]; return; }
+  win = [Math.max(0, g.s - 1.5), Math.min(D, g.e + 1.5)];
+}
+const tx = t => ((t - win[0]) / (win[1] - win[0])) * 100;
+
+function render() {
+  const g = gaps(), gc = g[cur];
+  $("title").textContent = g.length ? `Silence ${Math.min(cur + 1, g.length)} of ${g.length}` : "No silences found";
+  $("lengths").textContent = `Video: ${fmt(D)} → about ${fmt(kept())} after cuts`;
+  drawWave($("wave"), win[0], win[1], "#3d6fd9");
+  $("t0").textContent = fmt(win[0]); $("t1").textContent = fmt(win[1]); $("tm").textContent = fmt((win[0] + win[1]) / 2);
+  for (const el of ["cut", "e1", "e2"]) $(el).style.display = gc ? "" : "none";
+  if (gc) {
+    $("cut").style.left = tx(gc.s) + "%"; $("cut").style.width = (tx(gc.e) - tx(gc.s)) + "%";
+    $("e1").style.left = tx(gc.s) + "%"; $("e2").style.left = tx(gc.e) + "%";
+  }
+  updateHead();
+  drawOverview();
+}
+
+function updateHead() {
+  const t = vid.currentTime;
+  $("head").style.left = Math.min(100, Math.max(0, tx(t))) + "%";
+  if (document.activeElement !== slider) slider.value = Math.round(((t - win[0]) / (win[1] - win[0])) * 1000);
+  $("vb").classList.toggle("incut", inCut(t));
+  const gc = gaps()[cur];
+  $("info").innerHTML = `Slider at <b>${fmt(t)}</b>` + (gc ? ` &middot; Cutting <b>${fmt(gc.s)}</b> to <b>${fmt(gc.e)}</b> (${(gc.e - gc.s).toFixed(2)}s removed)` : "");
+}
+
+function seek(t) { vid.currentTime = Math.max(0, Math.min(D, t)); updateHead(); drawOverview(); }
+
+function go(k) {
+  const n = gaps().length;
+  cur = Math.max(0, Math.min(n - 1, k));
+  setWindow(); loadFrames();
+  const gc = gaps()[cur];
+  seek(gc ? (gc.s + gc.e) / 2 : 0);
+  render();
+}
+
+// Moving a cut edge moves the end of the piece before it, or the start of the piece after it.
+function setEdge(which, t) {
+  const gc = gaps()[cur]; if (!gc) return;
+  const before = pieces[gc.i - 1], after = pieces[gc.i];
+  if (which === 0) {
+    if (!before) return;
+    before[1] = Math.max(before[0] + 0.05, Math.min(t, gc.e - 0.02));
+  } else {
+    if (!after) return;
+    after[0] = Math.min(after[1] - 0.05, Math.max(t, gc.s + 0.02));
+  }
+  render();
+}
+
+function keepSilence() {
+  const gc = gaps()[cur]; if (!gc) return;
+  const before = pieces[gc.i - 1], after = pieces[gc.i];
+  if (before && after) { before[1] = after[1]; pieces.splice(gc.i, 1); }
+  else if (after) after[0] = 0;
+  else if (before) before[1] = D;
+  go(cur);
+}
+
+function deleteTake() {
+  const t = vid.currentTime, k = pieces.findIndex(([a, b]) => t >= a && t < b);
+  if (k < 0) { flash("Move the slider onto the talking part you want to delete."); return; }
+  pieces.splice(k, 1);
+  const g = gaps(); cur = Math.max(0, g.findIndex(x => x.e >= t));
+  go(cur);
+}
+
+function playAcross() {
+  const gc = gaps()[cur]; if (!gc) return;
+  stopPlay();
+  const start = gc.s > 0.01 ? Math.max(0, gc.s - 1) : gc.e, end = Math.min(D, gc.e + 1);
+  vid.currentTime = start; vid.play();
+  const tick = () => {
+    if (vid.currentTime >= gc.s && vid.currentTime < gc.e) vid.currentTime = gc.e;
+    if (vid.currentTime >= end || vid.paused) { stopPlay(); return; }
+    updateHead(); playStop = requestAnimationFrame(tick);
+  };
+  playStop = requestAnimationFrame(tick);
+}
+function stopPlay() { if (playStop) cancelAnimationFrame(playStop); playStop = null; vid.pause(); updateHead(); }
+
+function flash(msg) { $("status").textContent = msg; clearTimeout(flash.t); flash.t = setTimeout(() => $("status").textContent = "", 4000); }
+
+function dragEdge(el, which) {
+  el.addEventListener("pointerdown", ev => {
+    el.setPointerCapture(ev.pointerId);
+    const move = e => { const r = $("zoom").getBoundingClientRect(); const t = win[0] + ((e.clientX - r.left) / r.width) * (win[1] - win[0]); setEdge(which, t); seek(t); };
+    const up = () => { el.removeEventListener("pointermove", move); el.removeEventListener("pointerup", up); };
+    el.addEventListener("pointermove", move); el.addEventListener("pointerup", up);
+  });
+}
+
+async function save() {
+  stopPlay();
+  if (!pieces.length) { flash("Everything is cut. Keep at least one piece."); return; }
+  $("overlay").classList.add("show");
+  const r = await fetch("/save", { method: "POST", body: JSON.stringify({ pieces }) });
+  if (!r.ok) { $("ovTitle").textContent = "Could not save"; $("ovText").textContent = await r.text(); return; }
+  const poll = async () => {
+    const p = await (await fetch("/progress")).json();
+    $("ovBar").style.width = Math.round(p.value * 100) + "%";
+    if (p.phase === "saving") { $("ovText").textContent = Math.round(p.value * 100) + "%"; setTimeout(poll, 500); }
+    else if (p.phase === "done") { $("ovTitle").textContent = "Saved"; $("ovText").innerHTML = `<div class="path"></div><p>You can close this tab.</p>`; $("ovText").querySelector(".path").textContent = p.out; }
+    else { $("ovTitle").textContent = "Saving failed"; $("ovText").textContent = p.error || "Unknown error"; }
+  };
+  poll();
+}
+
+// wiring
+dragEdge($("e1"), 0); dragEdge($("e2"), 1);
+slider.addEventListener("input", () => { stopPlay(); seek(win[0] + (slider.value / 1000) * (win[1] - win[0])); });
+$("over").addEventListener("click", e => {
+  const r = e.currentTarget.getBoundingClientRect(), t = ((e.clientX - r.left) / r.width) * D, g = gaps();
+  let best = 0; g.forEach((x, k) => { const d = t < x.s ? x.s - t : t > x.e ? t - x.e : 0, bd = t < g[best].s ? g[best].s - t : t > g[best].e ? t - g[best].e : 0; if (d < bd) best = k; });
+  if (g.length) go(best);
+});
+$("prev").onclick = () => go(cur - 1);
+$("next").onclick = () => go(cur + 1);
+$("play").onclick = playAcross;
+$("keep").onclick = keepSilence;
+$("del").onclick = deleteTake;
+$("save").onclick = save;
+vid.addEventListener("timeupdate", () => { if (!playStop) { updateHead(); drawOverview(); } });
+document.addEventListener("keydown", e => {
+  if ($("overlay").classList.contains("show")) return;
+  const k = e.key, step = 1 / 30;
+  if (k === "Enter") go(cur + 1);
+  else if (k === "Backspace") go(cur - 1);
+  else if (k === " ") playStop ? stopPlay() : playAcross();
+  else if (k === "s" || k === "S") keepSilence();
+  else if (k === "d" || k === "D") deleteTake();
+  else if (k === "ArrowLeft") { stopPlay(); seek(vid.currentTime - step); }
+  else if (k === "ArrowRight") { stopPlay(); seek(vid.currentTime + step); }
+  else if (k === "[") setEdge(0, vid.currentTime);
+  else if (k === "]") setEdge(1, vid.currentTime);
+  else return;
+  e.preventDefault();
+});
+window.addEventListener("resize", () => { render(); drawFilm(); });
+addEventListener("pagehide", () => navigator.sendBeacon("/bye"));
+setInterval(() => fetch("/ping", { method: "POST" }).catch(() => {}), 10000);
+
+vid.addEventListener("error", () => {
+  if (vid.src.endsWith("/preview")) { flash("This video can't be previewed in the browser."); return; }
+  flash("Preparing a preview copy your browser can play...");
+  vid.src = "/preview";
+});
+vid.addEventListener("loadeddata", () => { if (vid.src.endsWith("/preview")) flash(""); });
+
+fetch("/data").then(r => r.json()).then(d => {
+  D = d.duration; FR = d.frame; db = d.db; pieces = d.pieces; document.title = d.name + " - Silence Cutter";
+  vid.src = "/video";
+  go(0);
+});
+</script>
+</body>
+</html>

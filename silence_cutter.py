@@ -1,9 +1,16 @@
 """Silence Cutter: find silences in a video, review them in the browser, render the cut."""
 import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
+import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
@@ -185,3 +192,232 @@ def next_output_path(src):
         out = src.with_name(f"{src.stem}_edited_{n}.mp4")
         n += 1
     return out
+
+
+# --- review server -------------------------------------------------------------------------
+
+HERE = Path(__file__).resolve().parent
+RELOAD_GRACE = 5      # seconds a closed page has to come back (a reload) before we cancel
+IDLE_TIMEOUT = 180    # no request at all for this long cancels (background tabs ping slowly)
+
+
+class State:
+    def __init__(self, src, info, db, pieces, tmp):
+        self.src, self.info, self.db, self.pieces, self.tmp = Path(src), info, db, pieces, Path(tmp)
+        self.phase, self.value, self.out, self.error = "review", 0.0, None, None
+        self.last_seen, self.bye_at = time.time(), None
+        self.lock = threading.Lock()
+        if info["hdr"]:
+            _write_tonemap_lut(info["transfer"], self.tmp / "tonemap.cube")
+
+    def cancelled(self):
+        now = time.time()
+        if self.phase != "review":
+            return False
+        if self.bye_at and self.last_seen <= self.bye_at and now - self.bye_at > RELOAD_GRACE:
+            return True
+        return now - self.last_seen > IDLE_TIMEOUT
+
+    def video_filter(self, extra):
+        return f"{extra},{HDR_TO_SDR}" if self.info["hdr"] else extra
+
+    def frames(self, start, end, n):
+        key = f"{start:.3f}_{end:.3f}_{n}"
+        folder = self.tmp / "frames" / key
+        if not folder.exists():
+            folder.mkdir(parents=True)
+            dur = max(0.1, end - start)
+            subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(self.src),
+                            "-vf", self.video_filter(f"fps={n / dur:.4f},scale=-2:160"), "-frames:v", str(n),
+                            "-q:v", "5", str(folder / "%02d.jpg")], cwd=self.tmp, capture_output=True)
+        return [f"/thumb/{key}/{p.name}" for p in sorted(folder.glob("*.jpg"))]
+
+    def preview(self):
+        path = self.tmp / "preview.mp4"
+        with self.lock:
+            if not path.exists():
+                subprocess.run(["ffmpeg", "-v", "error", "-i", str(self.src), "-vf", self.video_filter("scale=-2:540"),
+                                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", "-pix_fmt", "yuv420p",
+                                "-c:a", "aac", "-movflags", "+faststart", str(path)], cwd=self.tmp, capture_output=True)
+        return path
+
+    def save(self, pieces):
+        self.phase, self.out = "saving", next_output_path(self.src)
+
+        def work():
+            try:
+                render(self.src, self.info, pieces, self.out, lambda v: setattr(self, "value", v))
+                self.phase = "done"
+            except Exception as e:  # shown to the user on the page and in the console
+                self.error, self.phase = str(e), "error"
+
+        threading.Thread(target=work, daemon=True).start()
+
+
+def _valid_pieces(raw, duration):
+    try:
+        pieces = [(float(a), float(b)) for a, b in raw]
+    except (TypeError, ValueError):
+        return None
+    prev = 0.0
+    for a, b in pieces:
+        if not (prev - 1e-6 <= a < b <= duration + 0.05):
+            return None
+        prev = b
+    return pieces or None
+
+
+def make_server(state):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def send(self, code, body, ctype="application/json"):
+            if isinstance(body, str):
+                body = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def send_file(self, path, ctype):
+            size = path.stat().st_size
+            start, end = 0, size - 1
+            m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+            if m and (m[1] or m[2]):
+                start = int(m[1]) if m[1] else size - int(m[2])
+                end = min(int(m[2]), size - 1) if m[1] and m[2] else size - 1
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            else:
+                self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.end_headers()
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = f.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+
+        def do_GET(self):
+            state.last_seen = time.time()
+            url = urlparse(self.path)
+            q = parse_qs(url.query)
+            try:
+                if url.path == "/":
+                    self.send(200, (HERE / "review.html").read_bytes(), "text/html; charset=utf-8")
+                elif url.path == "/data":
+                    self.send(200, json.dumps({
+                        "duration": state.info["duration"], "frame": FRAME, "name": state.src.name,
+                        "db": [round(float(x), 1) for x in state.db], "pieces": state.pieces}))
+                elif url.path == "/video":
+                    self.send_file(state.src, "video/mp4")  # .mov is the same container family; browsers take it as mp4
+                elif url.path == "/preview":
+                    self.send_file(state.preview(), "video/mp4")
+                elif url.path == "/frames":
+                    start, end = float(q["start"][0]), float(q["end"][0])
+                    self.send(200, json.dumps(state.frames(start, end, max(1, min(30, int(q.get("n", ["12"])[0]))))))
+                elif url.path.startswith("/thumb/"):
+                    parts = url.path.split("/")
+                    if len(parts) != 4 or not re.fullmatch(r"[\d._]+", parts[2]) or not re.fullmatch(r"\d+\.jpg", parts[3]):
+                        return self.send(404, "not found", "text/plain")
+                    path = state.tmp / "frames" / parts[2] / parts[3]
+                    if not path.exists():
+                        return self.send(404, "not found", "text/plain")
+                    self.send(200, path.read_bytes(), "image/jpeg")
+                elif url.path == "/progress":
+                    self.send(200, json.dumps({"phase": state.phase, "value": state.value,
+                                               "out": str(state.out) if state.out else None, "error": state.error}))
+                else:
+                    self.send(404, "not found", "text/plain")
+            except (ConnectionError, BrokenPipeError):
+                pass  # the browser stopped reading, normal while seeking video
+
+        def do_POST(self):
+            state.last_seen = time.time()
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            if self.path == "/bye":
+                state.bye_at = state.last_seen
+                return self.send(204, b"")
+            if self.path == "/ping":
+                return self.send(204, b"")
+            if self.path == "/save":
+                if state.phase != "review":
+                    return self.send(409, "Already saving.", "text/plain")
+                try:
+                    pieces = _valid_pieces(json.loads(body).get("pieces"), state.info["duration"])
+                except (ValueError, AttributeError):
+                    pieces = None
+                if not pieces:
+                    return self.send(400, "The cut list is not valid.", "text/plain")
+                state.save(pieces)
+                return self.send(200, json.dumps({"out": str(state.out)}))
+            self.send(404, "not found", "text/plain")
+
+    return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+
+
+def _bar(label, v):
+    sys.stdout.write(f"\r  {label:<18} [{'#' * int(v * 30):-<30}] {v:4.0%} ")
+    sys.stdout.flush()
+
+
+def main():
+    if len(sys.argv) < 2:
+        raise SystemExit('Usage: python silence_cutter.py "path\\to\\video"')
+    src = Path(sys.argv[1].strip().strip('"')).resolve()
+    if not src.is_file():
+        raise SystemExit(f"File not found: {src}")
+    print(f"\n  {src.name}\n")
+    _bar("Finding silences", 0.1)
+    info, db, pieces = analyze(src)
+    _bar("Finding silences", 1.0)
+    if not pieces:
+        raise SystemExit("No speech found in this video, so there is nothing to keep.")
+    print(f"\n  Found {len(pieces)} spoken pieces.\n")
+    with tempfile.TemporaryDirectory(prefix="silence_cutter_") as tmp:
+        state = State(src, info, db, pieces, tmp)
+        srv = make_server(state)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{srv.server_address[1]}/"
+        webbrowser.open(url)
+        print(f"  Review the cuts in your browser: {url}")
+        print("  Closing the browser tab cancels. Nothing is saved until you press save.\n")
+        try:
+            while True:
+                time.sleep(0.3)
+                if state.phase == "saving":
+                    _bar("Saving", state.value)
+                elif state.phase == "done":
+                    _bar("Saving", 1.0)
+                    print(f"\n\n  Done! Saved to:\n  {state.out}\n")
+                    time.sleep(1.5)  # let the page show "Saved"
+                    break
+                elif state.phase == "error":
+                    print(f"\n\n  Saving failed:\n  {state.error}\n")
+                    break
+                elif state.cancelled():
+                    print("  Cancelled. Nothing was saved.\n")
+                    break
+        except KeyboardInterrupt:
+            print("\n  Cancelled. Nothing was saved.\n")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            print(f"\n  {e.code}\n")
+            sys.exit(1)
