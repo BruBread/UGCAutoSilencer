@@ -1,4 +1,5 @@
 """Plain-assert checks. Run: python test_silence_cutter.py"""
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -49,8 +50,9 @@ def test_next_output_path():
         assert sc.next_output_path(src).name == "a_edited_2.mp4"
 
 
-RAW = Path(r"C:\Users\user\Desktop\Jacobs Editing Shit\IMG_7006.MOV")
-HAND = Path(r"D:\New folder\samplecut.mp4")
+# Optional tuning check: a raw video and your own hand-cut version of it
+RAW = Path(os.environ.get("SAMPLE_RAW", "missing-sample-raw"))
+HAND = Path(os.environ.get("SAMPLE_EDIT", "missing-sample-edit"))
 
 
 def ffmpeg(*args):
@@ -93,7 +95,7 @@ def hand_edit_ranges(raw, hand, sr=8000, win=0.2):
 
 def test_sample_match():
     if not (RAW.exists() and HAND.exists()):
-        print("     skipped test_sample_match (sample files not found)")
+        print("     skipped test_sample_match (set SAMPLE_RAW and SAMPLE_EDIT to run it)")
         return
     _, _, pieces = sc.analyze(RAW)
     raw, hand = sc.decode_audio(RAW, 8000, band=False), sc.decode_audio(HAND, 8000, band=False)
