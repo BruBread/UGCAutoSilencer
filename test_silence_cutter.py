@@ -50,6 +50,67 @@ def test_next_output_path():
         assert sc.next_output_path(src).name == "a_edited_2.mp4"
 
 
+# "I've been using this serum for two weeks now, and honestly? My skin has never looked better.
+#  It doesn't feel sticky at all and you need like two drops." as whisper times it
+SPEECH = [(0.00, 0.20, " I've"), (0.20, 0.36, " been"), (0.36, 0.70, " using"), (0.70, 0.86, " this"),
+          (0.86, 1.30, " serum"), (1.30, 1.44, " for"), (1.44, 1.66, " two"), (1.66, 1.98, " weeks"),
+          (1.98, 2.20, " now,"), (2.55, 2.70, " and"), (2.70, 3.35, " honestly?"),
+          (3.60, 3.78, " My"), (3.78, 4.10, " skin"), (4.10, 4.26, " has"), (4.26, 4.55, " never"),
+          (4.55, 4.80, " looked"), (4.80, 5.20, " better."),
+          (5.50, 5.62, " It"), (5.62, 5.90, " doesn't"), (5.90, 6.10, " feel"), (6.10, 6.50, " sticky"),
+          (6.50, 6.62, " at"), (6.62, 6.95, " all"), (7.20, 7.30, " and"), (7.30, 7.50, " you"),
+          (7.50, 7.75, " need"), (7.75, 7.95, " like"), (7.95, 8.20, " two"), (8.20, 8.65, " drops.")]
+
+
+def texts(mode):
+    return [c[2] for c in sc.make_captions(SPEECH, mode)]
+
+
+def test_captions_low():
+    assert texts("low") == ["I've been using", "this serum", "for two weeks now", "and honestly", "My skin has",
+                            "never looked better", "It doesn't feel", "sticky at all", "and you need",
+                            "like two drops"], texts("low")
+
+
+def test_captions_medium():
+    assert texts("medium") == ["I've been using this serum", "for two weeks now and honestly",
+                               "My skin has never looked better", "It doesn't feel sticky at all",
+                               "and you need like two drops"], texts("medium")
+
+
+def test_captions_high_wraps_long_sentences():
+    assert texts("high") == ["I've been using this serum\nfor two weeks now and honestly",
+                             "My skin has never looked better",
+                             "It doesn't feel sticky at all\nand you need like two drops"], texts("high")
+
+
+def test_captions_never_break_badly():
+    words = [(i * 0.3, i * 0.3 + 0.3, w) for i, w in enumerate(
+        " So I went to the store and bought a bag of the best apples in town. Yes.".split(" ")[1:])]
+    for mode, (_, most) in sc.CAPTION_WORDS.items():
+        caps = sc.make_captions(words, mode)
+        assert caps[-1][2] == "Yes", (mode, caps)  # sentences never share a caption
+        for _, _, text in caps:
+            assert len(text.split()) <= most, (mode, text)
+            assert text.split()[-1].lower() not in sc.WEAK_ENDS, (mode, text)
+            assert not set(text) & set(".,?!"), (mode, text)
+
+
+def test_captions_timing():
+    caps = sc.make_captions(SPEECH, "low")
+    for (a, b, _), (c, _, _) in zip(caps, caps[1:]):
+        assert a < b <= c, caps  # in order, never overlapping
+    assert caps[0][1] == caps[1][0], caps  # back to back while talking, no flicker
+    assert abs(caps[-1][1] - (8.65 + sc.HOLD)) < 1e-9, caps[-1]
+    short = sc.make_captions([(1.0, 1.1, " Hi."), (3.0, 3.2, " Bye.")], "low")
+    assert short[0][1] - short[0][0] >= sc.MIN_SHOW and short[0][1] < 3.0, short
+
+
+def test_to_srt():
+    srt = sc.to_srt([(0.0, 1.5, "Hello there"), (3661.25, 3662.0, "two\nlines")])
+    assert srt == "1\n00:00:00,000 --> 00:00:01,500\nHello there\n\n2\n01:01:01,250 --> 01:01:02,000\ntwo\nlines\n\n", srt
+
+
 # Optional tuning check: a raw video and your own hand-cut version of it
 RAW = Path(os.environ.get("SAMPLE_RAW", "missing-sample-raw"))
 HAND = Path(os.environ.get("SAMPLE_EDIT", "missing-sample-edit"))
@@ -186,12 +247,13 @@ def test_server():
             r = urllib.request.urlopen(req)
             assert r.status == 206 and len(r.read()) == 10
             assert r.headers["Content-Range"].startswith("bytes 10-19/")
-            bad = urllib.request.Request(base + "/save", data=b'{"pieces": [[2, 1]]}', method="POST")
-            try:
-                urllib.request.urlopen(bad)
-                raise AssertionError("bad pieces accepted")
-            except urllib.error.HTTPError as e:
-                assert e.code == 400
+            for body in (b'{"pieces": [[2, 1]]}', b'{"pieces": [[0.5, 1.0]], "captions": "huge"}'):
+                bad = urllib.request.Request(base + "/save", data=body, method="POST")
+                try:
+                    urllib.request.urlopen(bad)
+                    raise AssertionError(f"bad save accepted: {body}")
+                except urllib.error.HTTPError as e:
+                    assert e.code == 400
             ok = urllib.request.Request(base + "/pieces", method="POST",
                                         data=b'{"pieces": [[0.5, 1.0], [2.0, 2.6]], "reviewed_until": 1.5}')
             assert urllib.request.urlopen(ok).status == 204

@@ -300,6 +300,110 @@ def next_output_path(src):
     return out
 
 
+# --- captions ------------------------------------------------------------------------------
+
+WHISPER_MODEL = "small.en"   # downloaded once (about 480 MB) on first use
+CAPTION_WORDS = {"low": (3.5, 4), "medium": (7, 8), "high": (10, 12)}  # (aim, most) words per caption
+LINE_WORDS = 8               # longer captions wrap onto two lines
+PAUSE = 0.2                  # a gap this long between words is a natural place to break
+HOLD = 0.2                   # a caption stays up this long after its last word
+FILL = 0.4                   # gaps shorter than this are bridged, so captions don't flicker
+MIN_SHOW = 0.5               # shortest time a caption is on screen
+# A caption never ends on one of these mid-sentence ("I went to the" / "store")
+WEAK_ENDS = set("a an the to of and or but so for with in on at by from into about as than that this these those "
+                "my your his her our their its i i'm i've i'd i'll we they he she like just very really super if "
+                "because when one two three four five six seven eight nine ten".split())
+
+
+def _clean(word):
+    """The word as shown: no punctuation around it (apostrophes inside stay, as in "don't")."""
+    return word.strip().strip('.,?!:;"…“”—')
+
+
+def _break_cost(words, i):
+    """Cost of ending a caption after words[i] when the sentence goes on."""
+    text = _clean(words[i][2]).lower()
+    if text in WEAK_ENDS or text.isdigit():
+        return 100
+    soft = words[i][2].strip()[-1:] in ",;:—" or (i + 1 < len(words) and words[i + 1][0] - words[i][1] >= PAUSE)
+    return -3 if soft else 0
+
+
+def _split(words, aim, most):
+    """Cut one sentence into word groups of at most `most`, close to `aim` each, at the least awkward places."""
+    n = len(words)
+    best = [(0.0, 0)] + [(float("inf"), 0)] * n  # best[i] = (cost of words[:i], where its last group starts)
+    for i in range(1, n + 1):
+        for j in range(i - 1, max(0, i - most) - 1, -1):  # on a tie the earlier group stays longer
+            c = best[j][0] + (i - j - aim) ** 2 + (_break_cost(words, i - 1) if i < n else 0)
+            if c < best[i][0]:
+                best[i] = (c, j)
+    groups, i = [], n
+    while i:
+        groups.append(words[best[i][1]:i])
+        i = best[i][1]
+    return groups[::-1]
+
+
+def _text(group):
+    words = [_clean(w[2]) for w in group]
+    if len(words) <= LINE_WORDS:
+        return " ".join(words)
+    k = min(range(1, len(words)), key=lambda k: (k - len(words) / 2) ** 2 + _break_cost(group, k - 1))
+    return " ".join(words[:k]) + "\n" + " ".join(words[k:])
+
+
+def make_captions(words, mode):
+    """(start, end, text) captions from whisper's (start, end, word) list. Sentences never share a caption."""
+    aim, most = CAPTION_WORDS[mode]
+    words = [w for w in words if _clean(w[2])]
+    groups, start = [], 0
+    for i, w in enumerate(words):
+        if w[2].strip()[-1:] in ".?!" or i == len(words) - 1:
+            groups += _split(words[start:i + 1], aim, most)
+            start = i + 1
+    caps = []
+    for k, g in enumerate(groups):
+        begin, last = g[0][0], g[-1][1]
+        nxt = groups[k + 1][0][0] if k + 1 < len(groups) else float("inf")
+        end = nxt if nxt - last < FILL else min(max(last + HOLD, begin + MIN_SHOW), nxt)
+        caps.append((begin, end, _text(g)))
+    return caps
+
+
+def to_srt(captions):
+    def stamp(t):
+        ms = round(t * 1000)
+        return f"{ms // 3600000:02d}:{ms // 60000 % 60:02d}:{ms // 1000 % 60:02d},{ms % 1000:03d}"
+    return "".join(f"{n}\n{stamp(a)} --> {stamp(b)}\n{text}\n\n" for n, (a, b, text) in enumerate(captions, 1))
+
+
+def transcribe(path, on_progress):
+    """[(start, end, word)] for the English speech in `path`."""
+    try:
+        from faster_whisper import WhisperModel  # only needed when captions are on
+    except ImportError:
+        raise RuntimeError("Captions need faster-whisper. Install it with: pip install faster-whisper") from None
+    model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", cpu_threads=os.cpu_count() or 4)
+    segments, info = model.transcribe(str(path), language="en", word_timestamps=True, vad_filter=True)
+    words = []
+    for seg in segments:
+        words += [(w.start, w.end, w.word) for w in seg.words]
+        on_progress(min(1.0, seg.end / info.duration) if info.duration else 0.0)
+    return words
+
+
+def write_captions(video, mode, on_progress):
+    """Write `<video>.srt` next to the video and return its path."""
+    caps = make_captions(transcribe(video, on_progress), mode)
+    if not caps:
+        raise RuntimeError("No speech was heard, so there are no captions.")
+    srt = Path(video).with_suffix(".srt")
+    srt.write_text(to_srt(caps), encoding="utf-8")
+    on_progress(1.0)
+    return srt
+
+
 # --- review server -------------------------------------------------------------------------
 
 HERE = Path(__file__).resolve().parent
@@ -311,6 +415,7 @@ class State:
     def __init__(self, src, info, db, pieces, tmp):
         self.src, self.info, self.db, self.pieces, self.tmp = Path(src), info, db, pieces, Path(tmp)
         self.phase, self.value, self.out, self.error = "review", 0.0, None, None
+        self.srt, self.caption_error = None, None
         self.last_seen, self.bye_at = time.time(), None
         self.lock = threading.Lock()
         self.cache = SegmentCache(src, info, self.tmp)  # also writes tonemap.cube there for HDR thumbnails
@@ -347,15 +452,22 @@ class State:
                                 "-c:a", "aac", "-movflags", "+faststart", str(path)], cwd=self.tmp, capture_output=True)
         return path
 
-    def save(self, pieces):
+    def save(self, pieces, captions=None):
         self.phase, self.out = "saving", next_output_path(self.src)
 
         def work():
             try:
                 render(self.src, self.info, pieces, self.out, lambda v: setattr(self, "value", v), self.cache)
-                self.phase = "done"
             except Exception as e:  # shown to the user on the page and in the console
                 self.error, self.phase = str(e), "error"
+                return
+            if captions:
+                self.phase, self.value = "captions", 0.0
+                try:
+                    self.srt = write_captions(self.out, captions, lambda v: setattr(self, "value", v))
+                except Exception as e:  # the video is already saved; only the captions are missing
+                    self.caption_error = str(e)
+            self.phase = "done"
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -442,7 +554,9 @@ def make_server(state):
                 elif url.path == "/progress":
                     self.send(200, json.dumps({"phase": state.phase, "value": state.value,
                                                "ready": state.cache.progress(list(state.cache.wanted)),
-                                               "out": str(state.out) if state.out else None, "error": state.error}))
+                                               "out": str(state.out) if state.out else None, "error": state.error,
+                                               "srt": str(state.srt) if state.srt else None,
+                                               "caption_error": state.caption_error}))
                 else:
                     self.send(404, "not found", "text/plain")
             except (ConnectionError, BrokenPipeError):
@@ -471,12 +585,14 @@ def make_server(state):
                 if state.phase != "review":
                     return self.send(409, "Already saving.", "text/plain")
                 try:
-                    pieces = _valid_pieces(json.loads(body).get("pieces"), state.info["duration"])
+                    msg = json.loads(body)
+                    pieces = _valid_pieces(msg.get("pieces"), state.info["duration"])
+                    captions = msg.get("captions") or None
                 except (ValueError, AttributeError):
                     pieces = None
-                if not pieces:
+                if not pieces or captions not in (None, *CAPTION_WORDS):
                     return self.send(400, "The cut list is not valid.", "text/plain")
-                state.save(pieces)
+                state.save(pieces, captions)
                 return self.send(200, json.dumps({"out": str(state.out)}))
             self.send(404, "not found", "text/plain")
 
@@ -514,9 +630,15 @@ def main():
                 time.sleep(0.3)
                 if state.phase == "saving":
                     _bar("Saving", state.value)
+                elif state.phase == "captions":
+                    _bar("Making captions", state.value)
                 elif state.phase == "done":
-                    _bar("Saving", 1.0)
+                    _bar("Making captions" if state.srt or state.caption_error else "Saving", 1.0)
                     print(f"\n\n  Done! Saved to:\n  {state.out}\n")
+                    if state.srt:
+                        print(f"  Captions:\n  {state.srt}\n")
+                    elif state.caption_error:
+                        print(f"  The video is saved, but the captions failed:\n  {state.caption_error}\n")
                     time.sleep(1.5)  # let the page show "Saved"
                     break
                 elif state.phase == "error":

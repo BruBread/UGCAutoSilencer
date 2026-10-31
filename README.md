@@ -10,6 +10,7 @@ You record a video, say your lines, and look away between them. UGC Auto Silence
 - **Review every cut before anything is saved.** A local browser page shows the video, a frame strip and the audio waveform for each silence, so you can see exactly where you look away.
 - **Drag to adjust.** Move the red cut edges, scrub with the slider, and play across the cut to check it sounds natural.
 - **Remove retakes.** Put the slider on a flubbed take and press **D** to delete it.
+- **Captions.** Optionally writes an `.srt` caption file next to the video, in short, medium or full-sentence lines.
 - **Fast saves.** Kept pieces are rendered in the background while you review, so saving is often instant.
 - **Works with iPhone footage.** It handles HEVC, HDR (Dolby Vision / HLG), rotated and variable frame rate video, and converts HDR to normal colors that match a CapCut export.
 - **Safe.** The original is never touched. Output goes to `<name>_edited.mp4`, then `_edited_2`, and so on, and is never overwritten.
@@ -17,7 +18,7 @@ You record a video, say your lines, and look away between them. UGC Auto Silence
 ## Requirements
 
 - Windows 10 or 11
-- [Python](https://www.python.org/downloads/) 3.10 or newer, with `numpy` installed
+- [Python](https://www.python.org/downloads/) 3.10 or newer, with `numpy` installed (and `faster-whisper` for captions)
 - [FFmpeg](https://ffmpeg.org/download.html) on your `PATH` (a full build, for the `zscale` filter used for HDR)
 - Optional: an AMD graphics card for faster encoding with `h264_amf`. Without one, it falls back to `libx264` on the CPU.
 
@@ -37,6 +38,21 @@ pip install -r requirements.txt
 4. Press **Save as is** (or **Ctrl+S**). The finished `<name>_edited.mp4` appears next to the original, and the window closes.
 
 Closing the browser tab without saving cancels, and nothing is written.
+
+### Captions
+
+Pick a mode in the **Captions** menu next to the save button before you save:
+
+| Mode | Words per caption |
+|---|---|
+| **Off** | No captions (the default) |
+| **Low** | 3 to 4, TikTok style |
+| **Medium** | 6 to 8 |
+| **High** | Full sentences, up to 12 words, wrapped onto two lines |
+
+After the video is saved, its speech is transcribed and `<name>_edited.srt` is written next to it, so CapCut and most players pick it up. Captions have no punctuation. They never run from one sentence into the next, break at commas and pauses where possible, and never end on a word like "the", "to" or "my".
+
+Transcription runs on your computer with Whisper (`small.en`, English only). The first time, it downloads the speech model (about 480 MB), so it needs internet once. After that it works offline and takes roughly as long as the video. If captions fail, the video is still saved.
 
 ### Review page controls
 
@@ -73,6 +89,8 @@ The detection settings are constants at the top of [`silence_cutter.py`](silence
 | `PAD` | `0.08` | Seconds kept before and after each spoken piece. Lower is tighter. |
 | `MIN_BLIP` | `0.10` | Sounds shorter than this are ignored. |
 | `FADE` | `0.01` | Audio fade at each cut, in seconds. |
+| `CAPTION_WORDS` | see code | Target and maximum words per caption for each mode. |
+| `WEAK_ENDS` | see code | Words a caption may not end on mid-sentence. |
 
 The defaults were tuned against a hand-edited iPhone video. Those settings keep everything the editor kept, apart from 0.74 s.
 
@@ -95,4 +113,5 @@ python test_silence_cutter.py
 - Windows only, because of the `.bat` launcher and Windows process priorities.
 - Retakes aren't detected automatically; remove them with **D** on the review page.
 - Output is always SDR H.264. HDR output isn't supported.
+- Captions are English only and are written as a separate `.srt` file, not burned into the video.
 - Videos with hundreds of cuts haven't been tested.
