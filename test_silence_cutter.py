@@ -181,12 +181,13 @@ def test_render_duration():
         src, out = Path(d) / "src.mp4", Path(d) / "out.mp4"
         ffmpeg("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-f", "lavfi", "-i", "sine=f=300",
                "-t", "4", "-pix_fmt", "yuv420p", str(src))
-        seen = []
-        sc.render(src, sc.probe(src), [(0.5, 1.5), (2.0, 3.0)], out, seen.append)
+        seen, steps = [], []
+        sc.render(src, sc.probe(src), [(0.5, 1.5), (2.0, 3.0)], out, seen.append, on_step=steps.append)
         got = sc.probe(out)["duration"]
         assert abs(got - 2.0) <= 0.1, got
         assert sc.probe(out)["transfer"] == "bt709"
         assert seen and max(seen) >= 0.99, seen[-3:]
+        assert steps[0] == "Rendering piece 1 of 2" and steps[-1] == "Joining pieces and audio", steps
 
 
 def stream_durations(path):

@@ -298,13 +298,23 @@ async function save() {
   $("overlay").classList.add("show");
   const r = await fetch("/save", { method: "POST", body: JSON.stringify({ pieces, captions: $("captions").value || null }) });
   if (!r.ok) { $("ovTitle").textContent = "Could not save"; $("ovText").textContent = await r.text(); return; }
+  const start = Date.now();
+  let last = { step: "", value: -1, at: start };
+  const clock = ms => `${Math.floor(ms / 60000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, "0")}`;
+  // "Rendering piece 3 of 8 · 41% · 0:52", plus a note when nothing has moved for a while
+  const status = (p, extra = "") => {
+    const now = Date.now();
+    if (p.step !== last.step || p.value !== last.value) last = { step: p.step, value: p.value, at: now };
+    const quiet = now - last.at > 20000 ? ` · Still working on this step (${clock(now - last.at)} without progress)` : "";
+    return `${p.step || "Starting"} ·${Math.round(p.value * 100)}% · ${clock(now - start)}${quiet}${extra}`;
+  };
   const poll = async () => {
     const p = await (await fetch("/progress")).json();
     $("ovBar").style.width = Math.round(p.value * 100) + "%";
-    if (p.phase === "saving") { $("ovText").textContent = Math.round(p.value * 100) + "%"; setTimeout(poll, 500); }
+    if (p.phase === "saving") { $("ovText").textContent = status(p); setTimeout(poll, 500); }
     else if (p.phase === "captions") {
       $("ovTitle").textContent = "Making captions...";
-      $("ovText").textContent = `${Math.round(p.value * 100)}%. The first time, this downloads the speech model (about 480 MB).`;
+      $("ovText").textContent = status(p, ". The first time, this downloads the speech model (about 480 MB).");
       setTimeout(poll, 500);
     }
     else if (p.phase === "done") {

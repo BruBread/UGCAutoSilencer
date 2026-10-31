@@ -204,6 +204,11 @@ class SegmentCache:
                 ready += (self.current[1] - self.current[0]) * self.current_part
             return ready / total
 
+    def status(self, keys):
+        with self.cond:
+            done = sum(k in self.done for k in keys)
+        return f"Rendering piece {min(done + 1, len(keys))} of {len(keys)}"
+
     def wait(self, keys, on_progress):
         while True:
             with self.cond:
@@ -269,7 +274,7 @@ class SegmentCache:
         raise RuntimeError("FFmpeg failed:\n" + "\n".join(err.strip().splitlines()[-5:]))
 
 
-def render(src, info, pieces, out, on_progress, cache=None):
+def render(src, info, pieces, out, on_progress, cache=None, on_step=lambda s: None):
     """Cut `pieces` out of `src` into `out`. Writes to a .part file first so a failure leaves nothing behind."""
     out = Path(out).resolve()
     part = out.with_suffix(".part.mp4")
@@ -282,7 +287,9 @@ def render(src, info, pieces, out, on_progress, cache=None):
             if not keys:
                 raise RuntimeError("Nothing to save: every piece is shorter than one frame.")
             cache.want(pieces)
-            cache.wait(keys, lambda v: on_progress(0.95 * v))
+            on_step(cache.status(keys))
+            cache.wait(keys, lambda v: (on_progress(0.95 * v), on_step(cache.status(keys))))
+            on_step("Joining pieces and audio")
             fps = cache.fps
             (cache.dir / "join.txt").write_text("".join(f"file 'seg_{a}_{b}.mp4'\n" for a, b in keys))
             audio = []
@@ -432,7 +439,7 @@ IDLE_TIMEOUT = 180    # no request at all for this long cancels (background tabs
 class State:
     def __init__(self, src, info, db, pieces, tmp):
         self.src, self.info, self.db, self.pieces, self.tmp = Path(src), info, db, pieces, Path(tmp)
-        self.phase, self.value, self.out, self.error = "review", 0.0, None, None
+        self.phase, self.value, self.out, self.error, self.step = "review", 0.0, None, None, ""
         self.srt, self.caption_error = None, None
         self.last_seen, self.bye_at = time.time(), None
         self.lock = threading.Lock()
@@ -475,12 +482,13 @@ class State:
 
         def work():
             try:
-                render(self.src, self.info, pieces, self.out, lambda v: setattr(self, "value", v), self.cache)
+                render(self.src, self.info, pieces, self.out, lambda v: setattr(self, "value", v), self.cache,
+                       lambda s: setattr(self, "step", s))
             except Exception as e:  # shown to the user on the page and in the console
                 self.error, self.phase = str(e), "error"
                 return
             if captions:
-                self.phase, self.value = "captions", 0.0
+                self.phase, self.value, self.step = "captions", 0.0, "Making captions"
                 try:
                     self.srt = write_captions(self.out, captions, lambda v: setattr(self, "value", v))
                 except Exception as e:  # the video is already saved; only the captions are missing
@@ -570,7 +578,7 @@ def make_server(state):
                         return self.send(404, "not found", "text/plain")
                     self.send(200, path.read_bytes(), "image/jpeg")
                 elif url.path == "/progress":
-                    self.send(200, json.dumps({"phase": state.phase, "value": state.value,
+                    self.send(200, json.dumps({"phase": state.phase, "value": state.value, "step": state.step,
                                                "ready": state.cache.progress(list(state.cache.wanted)),
                                                "out": str(state.out) if state.out else None, "error": state.error,
                                                "srt": str(state.srt) if state.srt else None,
@@ -618,7 +626,7 @@ def make_server(state):
 
 
 def _bar(label, v):
-    sys.stdout.write(f"\r  {label:<18} [{'#' * int(v * 30):-<30}] {v:4.0%} ")
+    sys.stdout.write(f"\r  {label:<26} [{'#' * int(v * 30):-<30}] {v:4.0%} ")
     sys.stdout.flush()
 
 
@@ -647,7 +655,7 @@ def main():
             while True:
                 time.sleep(0.3)
                 if state.phase == "saving":
-                    _bar("Saving", state.value)
+                    _bar(state.step or "Saving", state.value)
                 elif state.phase == "captions":
                     _bar("Making captions", state.value)
                 elif state.phase == "done":
