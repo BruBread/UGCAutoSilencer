@@ -26,7 +26,8 @@
   .cut { position:absolute; top:0; bottom:0; background:var(--cutbg); pointer-events:none; }
   .edge { position:absolute; top:-8px; bottom:-8px; width:22px; margin-left:-11px; cursor:ew-resize; }
   .edge::before { content:""; position:absolute; left:9px; top:0; bottom:0; width:4px; background:var(--cut); border-radius:2px; }
-  .edge span { position:absolute; top:-26px; left:50%; transform:translateX(-50%); white-space:nowrap; font-size:13px; font-weight:600; color:var(--cut); }
+  .edgelabels { position:relative; height:22px; margin-bottom:8px; }
+  .edgelabels span { position:absolute; top:0; white-space:nowrap; font-size:13px; font-weight:600; color:var(--cut); }
   .head { position:absolute; top:-4px; bottom:-4px; width:3px; margin-left:-1px; background:#fff; box-shadow:0 0 0 1px var(--ink); pointer-events:none; }
   .times { display:flex; justify-content:space-between; font-size:13px; color:var(--muted); margin-top:4px; }
   input[type=range] { width:100%; margin-top:12px; accent-color:var(--ink); }
@@ -56,13 +57,14 @@
   <div class="label">Whole video: click a red mark to jump to it</div>
   <canvas id="over"></canvas>
 
-  <div class="label" style="margin-top:34px">This silence, zoomed in: frames on top, audio below</div>
+  <div class="label" style="margin-top:24px">This silence, zoomed in: frames on top, audio below</div>
+  <div class="edgelabels" id="labels"><span id="l1">Cut starts</span><span id="l2">Cut ends</span><span id="lb">Cut</span></div>
   <div class="wrap" id="zoom">
     <canvas id="film"></canvas>
     <canvas id="wave"></canvas>
     <div class="cut" id="cut"></div>
-    <div class="edge" id="e1"><span>Cut starts</span></div>
-    <div class="edge" id="e2"><span>Cut ends</span></div>
+    <div class="edge" id="e1"></div>
+    <div class="edge" id="e2"></div>
     <div class="head" id="head"></div>
   </div>
   <div class="times"><span id="t0"></span><span id="tm"></span><span id="t1"></span></div>
@@ -172,13 +174,24 @@ function render() {
   $("lengths").textContent = `Video: ${fmt(D)} → about ${fmt(kept())} after cuts`;
   drawWave($("wave"), win[0], win[1], "#3d6fd9");
   $("t0").textContent = fmt(win[0]); $("t1").textContent = fmt(win[1]); $("tm").textContent = fmt((win[0] + win[1]) / 2);
-  for (const el of ["cut", "e1", "e2"]) $(el).style.display = gc ? "" : "none";
+  for (const el of ["cut", "e1", "e2", "labels"]) $(el).style.visibility = gc ? "" : "hidden";
   if (gc) {
     $("cut").style.left = tx(gc.s) + "%"; $("cut").style.width = (tx(gc.e) - tx(gc.s)) + "%";
     $("e1").style.left = tx(gc.s) + "%"; $("e2").style.left = tx(gc.e) + "%";
+    placeLabels((tx(gc.s) / 100) * $("zoom").clientWidth, (tx(gc.e) / 100) * $("zoom").clientWidth);
   }
   updateHead();
   drawOverview();
+}
+
+// Edge labels sit centered over their edge, kept inside the row; when they would touch, one "Cut" label replaces them.
+function placeLabels(x1, x2) {
+  const W = $("labels").clientWidth, l1 = $("l1"), l2 = $("l2"), lb = $("lb");
+  const at = (el, x) => { const w = el.offsetWidth, left = Math.max(0, Math.min(W - w, x - w / 2)); el.style.left = left + "px"; return [left, left + w]; };
+  for (const el of [l1, l2, lb]) el.style.display = "";
+  const a = at(l1, x1), b = at(l2, x2);
+  if (a[1] + 12 > b[0]) { l1.style.display = l2.style.display = "none"; at(lb, (x1 + x2) / 2); }
+  else lb.style.display = "none";
 }
 
 function updateHead() {

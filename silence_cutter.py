@@ -402,8 +402,7 @@ def main():
                     time.sleep(1.5)  # let the page show "Saved"
                     break
                 elif state.phase == "error":
-                    print(f"\n\n  Saving failed:\n  {state.error}\n")
-                    break
+                    raise SystemExit(f"\n  Saving failed:\n  {state.error}")
                 elif state.cancelled():
                     print("  Cancelled. Nothing was saved.\n")
                     break

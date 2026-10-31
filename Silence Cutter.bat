@@ -23,5 +23,5 @@ if not exist "%p%" (
 
 :run
 python silence_cutter.py "%p%"
-echo.
-pause
+rem Close on success or cancel; stay open on an error so it can be read
+if errorlevel 1 pause
