@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -130,58 +131,163 @@ HDR_TO_SDR = ("scale=in_color_matrix=bt2020:in_range=tv,format=gbrp16le,lut3d=fi
               "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p")
 
 
-def _filter_graph(pieces, info):
-    """Input i is piece i (seeked with -ss/-to), so only kept parts get decoded."""
-    lines, labels = [], []
-    for i, (a, b) in enumerate(pieces):
-        fade_out = max(0.0, b - a - FADE)
-        lines.append(f"[{i}:v]setpts=PTS-STARTPTS[v{i}];")
-        lines.append(f"[{i}:a]asetpts=PTS-STARTPTS,afade=t=in:d={FADE},afade=t=out:st={fade_out:.4f}:d={FADE}[a{i}];")
-        labels.append(f"[v{i}][a{i}]")
-    # Tag the result as SDR BT.709 so players don't treat converted iPhone footage as HDR
-    video_out = (HDR_TO_SDR if info["hdr"] else "format=yuv420p") + SDR_TAGS
-    lines.append(f"{''.join(labels)}concat=n={len(pieces)}:v=1:a=1[cv][outa];[cv]{video_out}[outv]")
-    return "\n".join(lines)
-
-
 ENCODERS = [
     ["-c:v", "h264_amf", "-quality", "quality", "-rc", "cqp", "-qp_i", "18", "-qp_p", "18"],
     ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18"],  # when the AMD encoder is unavailable
 ]
+BACKGROUND = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)  # keeps the review page snappy
 
 
-def render(src, info, pieces, out, on_progress):
+def _ffmpeg_with_progress(cmd, cwd, seconds, on_progress, flags=0, keep=lambda p: None):
+    """Run ffmpeg with -progress on stdout; return (returncode, stderr)."""
+    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=flags)
+    keep(p)
+    for line in p.stdout:
+        if line.startswith("out_time_us=") and seconds > 0:
+            us = line.split("=", 1)[1].strip()
+            if us.isdigit():
+                on_progress(min(1.0, int(us) / 1e6 / seconds))
+    return p.wait(), p.stderr.read()
+
+
+class SegmentCache:
+    """Renders each kept piece to its own video-only file in the background while the user reviews.
+    Saving then only re-renders pieces that changed and joins the rest without re-encoding.
+    Pieces are snapped to whole frames so the joined video and the audio stay in sync."""
+
+    def __init__(self, src, info, folder):
+        self.src, self.info, self.dir = Path(src).resolve(), info, Path(folder)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.fps = Fraction(info["fps"])
+        self.done, self.wanted = {}, []          # key = (first frame, end frame)
+        self.current, self.current_part = None, 0.0
+        self.error, self.encoder, self.stopped, self.proc = None, None, False, None
+        self.cond = threading.Condition()
+        if info["hdr"] and not (self.dir / "tonemap.cube").exists():
+            _write_tonemap_lut(info["transfer"], self.dir / "tonemap.cube")
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def keys(self, pieces):
+        keys = [(round(a * self.fps), round(b * self.fps)) for a, b in pieces]
+        return [k for k in keys if k[1] > k[0]]
+
+    def want(self, pieces, reviewed_until=float("inf")):
+        """Queue pieces; the ones the user already reviewed (before `reviewed_until`) go first."""
+        limit = reviewed_until * self.fps
+        with self.cond:
+            self.wanted = sorted(self.keys(pieces), key=lambda k: (k[1] >= limit, k[0]))
+            self.error = None
+            self.cond.notify_all()
+
+    def progress(self, keys):
+        with self.cond:
+            total = sum(b - a for a, b in keys) or 1
+            ready = sum(b - a for a, b in keys if (a, b) in self.done)
+            if self.current in keys:
+                ready += (self.current[1] - self.current[0]) * self.current_part
+            return ready / total
+
+    def wait(self, keys, on_progress):
+        while True:
+            with self.cond:
+                if self.error:
+                    raise RuntimeError(self.error)
+                if all(k in self.done for k in keys):
+                    return
+                self.cond.wait(0.3)
+            on_progress(self.progress(keys))
+
+    def stop(self):
+        with self.cond:
+            self.stopped = True
+            self.cond.notify_all()
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+
+    def _run(self):
+        while True:
+            with self.cond:
+                while not self.stopped and not [k for k in self.wanted if k not in self.done]:
+                    self.cond.wait()
+                if self.stopped:
+                    return
+                key = next(k for k in self.wanted if k not in self.done)
+                self.current, self.current_part = key, 0.0
+            try:
+                path = self._render(key)
+            except Exception as e:  # any failure must reach the waiting save, never leave it hanging
+                with self.cond:
+                    self.error, self.wanted, self.current = str(e), [], None
+                    self.cond.notify_all()
+                continue
+            with self.cond:
+                self.done[key], self.current = path, None
+                self.cond.notify_all()
+
+    def _render(self, key):
+        first, end = key
+        path = self.dir / f"seg_{first}_{end}.mp4"
+        part = path.with_suffix(".part.mp4")
+        frames = end - first
+        convert = (HDR_TO_SDR if self.info["hdr"] else "format=yuv420p") + SDR_TAGS
+        err = ""
+        for enc in [self.encoder] if self.encoder else ENCODERS:  # every segment must use the same encoder to join
+            cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{float(first / self.fps):.6f}",
+                   "-to", f"{float(end / self.fps):.6f}",
+                   "-i", str(self.src), "-an", "-vf", f"{convert},tpad=stop_mode=clone:stop=2",
+                   "-fps_mode", "cfr", "-r", self.info["fps"], "-frames:v", str(frames), *enc,
+                   "-progress", "pipe:1", "-nostats", str(part)]
+            code, err = _ffmpeg_with_progress(cmd, self.dir, float(frames / self.fps),
+                                              lambda v: setattr(self, "current_part", v),
+                                              BACKGROUND, lambda p: setattr(self, "proc", p))
+            if code == 0:
+                self.encoder = enc
+                os.replace(part, path)
+                return path
+            part.unlink(missing_ok=True)
+            if self.stopped or not self.src.exists():
+                break
+        raise RuntimeError("FFmpeg failed:\n" + "\n".join(err.strip().splitlines()[-5:]))
+
+
+def render(src, info, pieces, out, on_progress, cache=None):
     """Cut `pieces` out of `src` into `out`. Writes to a .part file first so a failure leaves nothing behind."""
     out = Path(out).resolve()
     part = out.with_suffix(".part.mp4")
-    total = sum(b - a for a, b in pieces)
-    # ponytail: one input per piece; a few hundred pieces would hit the Windows command-line limit
-    inputs = [x for a, b in pieces for x in ("-ss", f"{a:.4f}", "-to", f"{b:.4f}", "-i", str(Path(src).resolve()))]
-    with tempfile.TemporaryDirectory() as work:  # ffmpeg runs here so filter files need no path escaping
-        (Path(work) / "graph.txt").write_text(_filter_graph(pieces, info))
-        if info["hdr"]:
-            _write_tonemap_lut(info["transfer"], Path(work) / "tonemap.cube")
-        err = ""
-        for enc in ENCODERS:
-            cmd = ["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex_script", "graph.txt",
-                   "-map", "[outv]", "-map", "[outa]", *enc, "-pix_fmt", "yuv420p",
-                   "-fps_mode", "cfr", "-r", info["fps"], "-c:a", "aac", "-b:a", "192k",
-                   "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", str(part)]
-            p = subprocess.Popen(cmd, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            for line in p.stdout:
-                if line.startswith("out_time_us=") and total > 0:
-                    us = line.split("=", 1)[1].strip()
-                    if us.isdigit():
-                        on_progress(min(1.0, int(us) / 1e6 / total))
-            err = p.stderr.read()
-            if p.wait() == 0:
-                os.replace(part, out)
-                on_progress(1.0)
-                return
-            part.unlink(missing_ok=True)
-            if not Path(src).exists():
-                break
-        raise RuntimeError("FFmpeg failed:\n" + "\n".join(err.strip().splitlines()[-5:]))
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as own:
+        own_cache = cache is None
+        if own_cache:
+            cache = SegmentCache(src, info, own)
+        try:
+            keys = cache.keys(pieces)
+            if not keys:
+                raise RuntimeError("Nothing to save: every piece is shorter than one frame.")
+            cache.want(pieces)
+            cache.wait(keys, lambda v: on_progress(0.95 * v))
+            fps = cache.fps
+            (cache.dir / "join.txt").write_text("".join(f"file 'seg_{a}_{b}.mp4'\n" for a, b in keys))
+            audio = []
+            for i, (a, b) in enumerate(keys):
+                dur = float((b - a) / fps)
+                audio.append(f"[1:a]atrim=start={float(a / fps):.6f}:end={float(b / fps):.6f},asetpts=PTS-STARTPTS,"
+                             f"afade=t=in:d={FADE},afade=t=out:st={max(0.0, dur - FADE):.6f}:d={FADE}[a{i}];")
+            audio.append("".join(f"[a{i}]" for i in range(len(keys))) + f"concat=n={len(keys)}:v=0:a=1[outa]")
+            (cache.dir / "audio.txt").write_text("\n".join(audio))
+            code, err = _ffmpeg_with_progress(
+                ["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", "join.txt", "-i", str(cache.src),
+                 "-filter_complex_script", "audio.txt", "-map", "0:v", "-map", "[outa]", "-c:v", "copy",
+                 "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats",
+                 str(part)],
+                cache.dir, float(sum(b - a for a, b in keys) / fps), lambda v: on_progress(0.95 + 0.05 * v))
+            if code != 0:
+                part.unlink(missing_ok=True)
+                raise RuntimeError("FFmpeg failed:\n" + "\n".join(err.strip().splitlines()[-5:]))
+            os.replace(part, out)
+            on_progress(1.0)
+        finally:
+            if own_cache:
+                cache.stop()
 
 
 def next_output_path(src):
@@ -207,8 +313,8 @@ class State:
         self.phase, self.value, self.out, self.error = "review", 0.0, None, None
         self.last_seen, self.bye_at = time.time(), None
         self.lock = threading.Lock()
-        if info["hdr"]:
-            _write_tonemap_lut(info["transfer"], self.tmp / "tonemap.cube")
+        self.cache = SegmentCache(src, info, self.tmp)  # also writes tonemap.cube there for HDR thumbnails
+        self.cache.want(pieces, reviewed_until=0)
 
     def cancelled(self):
         now = time.time()
@@ -246,7 +352,7 @@ class State:
 
         def work():
             try:
-                render(self.src, self.info, pieces, self.out, lambda v: setattr(self, "value", v))
+                render(self.src, self.info, pieces, self.out, lambda v: setattr(self, "value", v), self.cache)
                 self.phase = "done"
             except Exception as e:  # shown to the user on the page and in the console
                 self.error, self.phase = str(e), "error"
@@ -335,6 +441,7 @@ def make_server(state):
                     self.send(200, path.read_bytes(), "image/jpeg")
                 elif url.path == "/progress":
                     self.send(200, json.dumps({"phase": state.phase, "value": state.value,
+                                               "ready": state.cache.progress(list(state.cache.wanted)),
                                                "out": str(state.out) if state.out else None, "error": state.error}))
                 else:
                     self.send(404, "not found", "text/plain")
@@ -348,6 +455,17 @@ def make_server(state):
                 state.bye_at = state.last_seen
                 return self.send(204, b"")
             if self.path == "/ping":
+                return self.send(204, b"")
+            if self.path == "/pieces":  # the page's latest cuts, so the background render can keep up
+                try:
+                    msg = json.loads(body)
+                    pieces = _valid_pieces(msg.get("pieces"), state.info["duration"])
+                    reviewed = float(msg.get("reviewed_until", 0))
+                except (ValueError, AttributeError, TypeError):
+                    pieces = None
+                if not pieces or state.phase != "review":
+                    return self.send(400, "The cut list is not valid.", "text/plain")
+                state.cache.want(pieces, reviewed)
                 return self.send(204, b"")
             if self.path == "/save":
                 if state.phase != "review":
@@ -383,7 +501,7 @@ def main():
     if not pieces:
         raise SystemExit("No speech found in this video, so there is nothing to keep.")
     print(f"\n  Found {len(pieces)} spoken pieces.\n")
-    with tempfile.TemporaryDirectory(prefix="silence_cutter_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="silence_cutter_", ignore_cleanup_errors=True) as tmp:
         state = State(src, info, db, pieces, tmp)
         srv = make_server(state)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -411,6 +529,7 @@ def main():
         finally:
             srv.shutdown()
             srv.server_close()
+            state.cache.stop()
 
 
 if __name__ == "__main__":

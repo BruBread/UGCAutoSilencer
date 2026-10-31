@@ -124,6 +124,32 @@ def test_render_duration():
         assert seen and max(seen) >= 0.99, seen[-3:]
 
 
+def stream_durations(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration", "-of", "csv=p=0",
+                        str(path)], capture_output=True, text=True)
+    return {kind: float(dur) for kind, dur in (line.split(",") for line in r.stdout.split())}
+
+
+def test_cache_reuses_segments_and_keeps_sync():
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "src.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30", "-f", "lavfi", "-i", "sine=f=300",
+               "-t", "4", "-pix_fmt", "yuv420p", str(src))
+        info = sc.probe(src)
+        cache = sc.SegmentCache(src, info, Path(d) / "cache")
+        try:
+            sc.render(src, info, [(0.5, 1.5), (2.0, 3.0)], Path(d) / "a.mp4", lambda p: None, cache)
+            first = set((Path(d) / "cache").glob("seg_*.mp4"))
+            assert len(first) == 2, first
+            # moving one cut edge re-renders only the piece it touches
+            sc.render(src, info, [(0.5, 1.5), (2.0, 3.2)], Path(d) / "b.mp4", lambda p: None, cache)
+            assert len(set((Path(d) / "cache").glob("seg_*.mp4")) - first) == 1
+        finally:
+            cache.stop()
+        durs = stream_durations(Path(d) / "b.mp4")
+        assert abs(durs["video"] - 2.2) <= 0.04 and abs(durs["audio"] - durs["video"]) <= 0.04, durs
+
+
 def test_render_failure_leaves_nothing():
     with tempfile.TemporaryDirectory() as d:
         out = Path(d) / "out.mp4"
@@ -164,11 +190,18 @@ def test_server():
                 raise AssertionError("bad pieces accepted")
             except urllib.error.HTTPError as e:
                 assert e.code == 400
+            ok = urllib.request.Request(base + "/pieces", method="POST",
+                                        data=b'{"pieces": [[0.5, 1.0], [2.0, 2.6]], "reviewed_until": 1.5}')
+            assert urllib.request.urlopen(ok).status == 204
+            assert state.cache.wanted == [(15, 30), (60, 78)], state.cache.wanted
+            ready = json.load(urllib.request.urlopen(base + "/progress"))["ready"]
+            assert 0 <= ready <= 1, ready
             urls = json.load(urllib.request.urlopen(base + "/frames?start=0&end=2&n=4"))
             assert len(urls) == 4 and urllib.request.urlopen(base + urls[0]).read()[:2] == b"\xff\xd8"
         finally:
             srv.shutdown()
             srv.server_close()
+            state.cache.stop()
 
 
 if __name__ == "__main__":
